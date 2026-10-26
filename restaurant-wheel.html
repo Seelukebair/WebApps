@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Restaurant Wheel</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8D%BD%EF%B8%8F%3C/text%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #1a1a2e;
@@ -436,6 +437,123 @@
     hideSuggestions();
   }
 
+  // Overpass has rotating availability — try mirrors in order, retry transient errors
+  const OVERPASS_MIRRORS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  ];
+  async function overpassFetch(query) {
+    let lastErr = null;
+    for (let i = 0; i < OVERPASS_MIRRORS.length; i++) {
+      const url = OVERPASS_MIRRORS[i];
+      const host = new URL(url).hostname;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s per mirror
+      try {
+        if (i > 0) setStatus(`Trying mirror ${i + 1}/${OVERPASS_MIRRORS.length} (${host})…`);
+        const res = await fetch(url, {
+          method: 'POST',
+          body: 'data=' + encodeURIComponent(query),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        if (res.ok) return await res.json();
+        lastErr = new Error('Overpass ' + res.status + ' from ' + host);
+        if (res.status < 500 && res.status !== 429) throw lastErr;
+      } catch (e) {
+        clearTimeout(timeoutId);
+        lastErr = e.name === 'AbortError'
+          ? new Error('Timeout from ' + host)
+          : e;
+      }
+    }
+    throw lastErr || new Error('All Overpass mirrors failed');
+  }
+
+  // Haversine for client-side distance filtering (miles)
+  function haversineMiles(lat1, lon1, lat2, lon2) {
+    const R = 3958.8;
+    const toRad = (d) => d * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a = Math.sin(dLat / 2) ** 2 +
+              Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+  }
+
+  // Normalize an Overpass element into our shape
+  function normalizeOverpass(el) {
+    const tags = el.tags || {};
+    const name = tags.name || tags['name:en'];
+    if (!name) return null;
+    const cuisine = tags.cuisine ? tags.cuisine.replace(/_/g, ' ') : '';
+    const website = tags.website || tags['contact:website'] || '';
+    const lat = el.lat ?? el.center?.lat;
+    const lon = el.lon ?? el.center?.lon;
+    return { id: el.id, name, cuisine, website, lat, lon };
+  }
+
+  // Fallback 1: Photon (Komoot) — OSM-based, separate infra from Overpass
+  async function photonFetch(lat, lon, miles) {
+    const url = `https://photon.komoot.io/api/?q=restaurant&lat=${lat}&lon=${lon}&limit=50&osm_tag=amenity:restaurant`;
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), 10000);
+    try {
+      const res = await fetch(url, { signal: ctl.signal });
+      if (!res.ok) throw new Error('Photon ' + res.status);
+      const data = await res.json();
+      return (data.features || [])
+        .map(f => {
+          const name = f.properties?.name;
+          if (!name) return null;
+          const [plon, plat] = f.geometry?.coordinates || [];
+          if (plat == null || plon == null) return null;
+          if (haversineMiles(lat, lon, plat, plon) > miles) return null;
+          return {
+            id: f.properties.osm_id,
+            name,
+            cuisine: '',
+            website: '',
+            lat: plat,
+            lon: plon,
+          };
+        })
+        .filter(Boolean);
+    } finally { clearTimeout(to); }
+  }
+
+  // Fallback 2: Nominatim POI search — same OSM data, different endpoint
+  async function nominatimPoiFetch(lat, lon, miles) {
+    const d = miles / 69; // rough degrees-per-mile for viewbox
+    const viewbox = `${lon - d},${lat + d},${lon + d},${lat - d}`;
+    const url = `https://nominatim.openstreetmap.org/search?format=json&q=restaurant&limit=50&bounded=1&extratags=1&viewbox=${viewbox}`;
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), 10000);
+    try {
+      const res = await fetch(url, { signal: ctl.signal, headers: { 'Accept': 'application/json' } });
+      if (!res.ok) throw new Error('Nominatim ' + res.status);
+      const data = await res.json();
+      return data.map(r => {
+        const plat = parseFloat(r.lat);
+        const plon = parseFloat(r.lon);
+        const name = r.name || (r.display_name || '').split(',')[0].trim();
+        if (!name) return null;
+        if (haversineMiles(lat, lon, plat, plon) > miles) return null;
+        const extra = r.extratags || {};
+        return {
+          id: r.osm_id,
+          name,
+          cuisine: extra.cuisine ? extra.cuisine.replace(/_/g, ' ') : '',
+          website: extra.website || extra['contact:website'] || '',
+          lat: plat,
+          lon: plon,
+        };
+      }).filter(Boolean);
+    } finally { clearTimeout(to); }
+  }
+
   async function geocodeAddress(addr) {
     // Nominatim (OSM) — free, no key. Be polite: 1 req/sec, real UA via referer.
     const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(addr)}`;
@@ -462,7 +580,6 @@
         setCoordsInfo();
       }
 
-      setStatus('Searching restaurants...');
       const miles = parseFloat(els.dist.value);
       const meters = Math.round(miles * 1609.34);
       const overpassQuery = `
@@ -473,30 +590,37 @@
         );
         out center tags;
       `;
-      const res = await fetch('https://overpass-api.de/api/interpreter', {
-        method: 'POST',
-        body: 'data=' + encodeURIComponent(overpassQuery),
-      });
-      if (!res.ok) throw new Error('Overpass error ' + res.status);
-      const data = await res.json();
+
+      // Try Overpass (with mirror fallback), then Photon, then Nominatim POI
+      let items = null, source = null;
+      try {
+        setStatus('Searching OpenStreetMap (Overpass)…');
+        const data = await overpassFetch(overpassQuery);
+        items = (data.elements || []).map(normalizeOverpass).filter(Boolean);
+        source = 'Overpass';
+      } catch (e1) {
+        console.warn('Overpass failed:', e1);
+        try {
+          setStatus('Overpass unavailable — trying Photon…');
+          items = await photonFetch(userLocation.lat, userLocation.lon, miles);
+          source = 'Photon';
+          if (!items.length) throw new Error('Photon returned no results');
+        } catch (e2) {
+          console.warn('Photon failed:', e2);
+          setStatus('Trying Nominatim POI search…');
+          items = await nominatimPoiFetch(userLocation.lat, userLocation.lon, miles);
+          source = 'Nominatim';
+        }
+      }
 
       const hiddenNames = loadHidden();
       const seen = new Set();
-      restaurants = data.elements
-        .map(el => {
-          const tags = el.tags || {};
-          const name = tags.name || tags['name:en'];
-          if (!name) return null;
-          const cuisine = tags.cuisine ? tags.cuisine.replace(/_/g, ' ') : '';
-          const website = tags.website || tags['contact:website'] || '';
-          const lat = el.lat ?? el.center?.lat;
-          const lon = el.lon ?? el.center?.lon;
-          return { id: el.id, name, cuisine, website, lat, lon, hidden: hiddenNames.has(name) };
-        })
-        .filter(r => r && !seen.has(r.name) && seen.add(r.name))
+      restaurants = items
+        .map(r => ({ ...r, hidden: hiddenNames.has(r.name) }))
+        .filter(r => !seen.has(r.name) && seen.add(r.name))
         .sort((a, b) => a.name.localeCompare(b.name));
 
-      setStatus(`Found ${restaurants.length} restaurants within ${miles} mi.`);
+      setStatus(`Found ${restaurants.length} restaurants within ${miles} mi (via ${source}).`);
       renderList();
       drawWheel();
       els.spinBtn.disabled = restaurants.length === 0;
