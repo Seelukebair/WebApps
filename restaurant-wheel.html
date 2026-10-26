@@ -444,32 +444,33 @@
     'https://overpass.private.coffee/api/interpreter',
     'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
   ];
+  // Race all Overpass mirrors in parallel; first success wins, losers get aborted.
   async function overpassFetch(query) {
-    let lastErr = null;
-    for (let i = 0; i < OVERPASS_MIRRORS.length; i++) {
-      const url = OVERPASS_MIRRORS[i];
+    const controllers = OVERPASS_MIRRORS.map(() => new AbortController());
+    const attempts = OVERPASS_MIRRORS.map((url, i) => {
+      const ctl = controllers[i];
       const host = new URL(url).hostname;
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s per mirror
-      try {
-        if (i > 0) setStatus(`Trying mirror ${i + 1}/${OVERPASS_MIRRORS.length} (${host})…`);
-        const res = await fetch(url, {
-          method: 'POST',
-          body: 'data=' + encodeURIComponent(query),
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutId);
-        if (res.ok) return await res.json();
-        lastErr = new Error('Overpass ' + res.status + ' from ' + host);
-        if (res.status < 500 && res.status !== 429) throw lastErr;
-      } catch (e) {
-        clearTimeout(timeoutId);
-        lastErr = e.name === 'AbortError'
-          ? new Error('Timeout from ' + host)
-          : e;
-      }
+      const timeoutId = setTimeout(() => ctl.abort(), 10000);
+      return (async () => {
+        try {
+          const res = await fetch(url, {
+            method: 'POST',
+            body: 'data=' + encodeURIComponent(query),
+            signal: ctl.signal,
+          });
+          if (!res.ok) throw new Error('Overpass ' + res.status + ' from ' + host);
+          return await res.json();
+        } finally { clearTimeout(timeoutId); }
+      })();
+    });
+    try {
+      const result = await Promise.any(attempts);
+      // Cancel still-pending losers
+      controllers.forEach(c => { try { c.abort(); } catch {} });
+      return result;
+    } catch (e) {
+      throw new Error('All Overpass mirrors unavailable');
     }
-    throw lastErr || new Error('All Overpass mirrors failed');
   }
 
   // Haversine for client-side distance filtering (miles)
@@ -591,26 +592,24 @@
         out center tags;
       `;
 
-      // Try Overpass (with mirror fallback), then Photon, then Nominatim POI
+      // Race Overpass mirrors first; if all fail, race Photon vs Nominatim.
       let items = null, source = null;
       try {
-        setStatus('Searching OpenStreetMap (Overpass)…');
+        setStatus('Searching OpenStreetMap…');
         const data = await overpassFetch(overpassQuery);
         items = (data.elements || []).map(normalizeOverpass).filter(Boolean);
         source = 'Overpass';
       } catch (e1) {
         console.warn('Overpass failed:', e1);
-        try {
-          setStatus('Overpass unavailable — trying Photon…');
-          items = await photonFetch(userLocation.lat, userLocation.lon, miles);
-          source = 'Photon';
-          if (!items.length) throw new Error('Photon returned no results');
-        } catch (e2) {
-          console.warn('Photon failed:', e2);
-          setStatus('Trying Nominatim POI search…');
-          items = await nominatimPoiFetch(userLocation.lat, userLocation.lon, miles);
-          source = 'Nominatim';
-        }
+        setStatus('Overpass unavailable — trying Photon + Nominatim…');
+        const race = await Promise.any([
+          photonFetch(userLocation.lat, userLocation.lon, miles)
+            .then(r => { if (!r.length) throw new Error('Photon empty'); return { items: r, source: 'Photon' }; }),
+          nominatimPoiFetch(userLocation.lat, userLocation.lon, miles)
+            .then(r => ({ items: r, source: 'Nominatim' })),
+        ]);
+        items = race.items;
+        source = race.source;
       }
 
       const hiddenNames = loadHidden();
